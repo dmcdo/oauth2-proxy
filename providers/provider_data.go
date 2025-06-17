@@ -37,6 +37,8 @@ type ProviderData struct {
 	ClientSecret      string
 	ClientSecretFile  string
 	Scope             string
+	// The response mode requested from the provider or empty for default ("query")
+	AuthRequestResponseMode string
 	// The picked CodeChallenge Method or empty if none.
 	CodeChallengeMethod string
 	// Code challenge methods supported by the Provider
@@ -49,6 +51,7 @@ type ProviderData struct {
 	GroupsClaim          string
 	Verifier             internaloidc.IDTokenVerifier
 	ExpirationCheck      internaloidc.IDTokenExpirationCheck
+	SkipClaimsFromProfileURL bool
 
 	// Universal Group authorization data structure
 	// any provider can set to consume
@@ -57,6 +60,8 @@ type ProviderData struct {
 	getAuthorizationHeaderFunc func(string) http.Header
 	loginURLParameterDefaults  url.Values
 	loginURLParameterOverrides map[string]*regexp.Regexp
+
+	BackendLogoutURL string
 }
 
 // Data returns the ProviderData
@@ -284,7 +289,12 @@ func (p *ProviderData) buildSessionFromClaims(rawIDToken, accessToken string) (*
 }
 
 func (p *ProviderData) getClaimExtractor(rawIDToken, accessToken string) (util.ClaimExtractor, error) {
-	extractor, err := util.NewClaimExtractor(context.TODO(), rawIDToken, p.ProfileURL, p.getAuthorizationHeader(accessToken))
+	profileURL := p.ProfileURL
+	if p.SkipClaimsFromProfileURL {
+		profileURL = &url.URL{}
+	}
+
+	extractor, err := util.NewClaimExtractor(context.TODO(), rawIDToken, profileURL, p.getAuthorizationHeader(accessToken))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialise claim extractor: %v", err)
 	}

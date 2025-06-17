@@ -10,8 +10,7 @@ import (
 	"net/url"
 	"sync/atomic"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -26,6 +25,12 @@ const (
         "idTokenGroup1",
         "idTokenGroup2"
       ],
+	  "nested-groups-claim-containing-hyphen": {
+			"groups": [
+				"nestedClaimContainingHypenGroup1",
+				"nestedClaimContainingHypenGroup2"
+			]
+	  },
       "https://groups.test": [
         "fqdnGroup1",
         "fqdnGroup2"
@@ -238,6 +243,18 @@ var _ = Describe("Claim Extractor Suite", func() {
 				claim:         "https://groups.test",
 				expectExists:  true,
 				expectedValue: []interface{}{"fqdnGroup1", "fqdnGroup2"},
+				expectedError: nil,
+			}),
+			Entry("retrieves claim with nested groups claim containing hyphen", getClaimTableInput{
+				testClaimExtractorOpts: testClaimExtractorOpts{
+					idTokenPayload:        basicIDTokenPayload,
+					setProfileURL:         true,
+					profileRequestHeaders: newAuthorizedHeader(),
+					profileRequestHandler: shouldNotBeRequestedProfileHandler,
+				},
+				claim:         "nested-groups-claim-containing-hyphen.groups",
+				expectExists:  true,
+				expectedValue: []interface{}{"nestedClaimContainingHypenGroup1", "nestedClaimContainingHypenGroup2"},
 				expectedError: nil,
 			}),
 		)
@@ -480,6 +497,54 @@ var _ = Describe("Claim Extractor Suite", func() {
 			expectedDst: stringPointer("{\"foo\":[\"bar\",\"baz\"]}"),
 		}),
 	)
+
+	It("should extract claims from a JWT response", func() {
+		jwtResponsePayload := `{
+			"user": "jwtUser",
+			"email": "jwtEmail",
+			"groups": [
+				"jwtGroup1",
+				"jwtGroup2"
+			]
+		}`
+
+		jwtResponseHandler := func(rw http.ResponseWriter, req *http.Request) {
+			if !hasAuthorizedHeader(req.Header) {
+				rw.WriteHeader(403)
+				rw.Write([]byte("Unauthorized"))
+				return
+			}
+
+			rw.Header().Set("Content-Type", "application/jwt; charset=utf-8")
+			rw.Write([]byte(createJWTFromPayload(jwtResponsePayload)))
+		}
+
+		claimExtractor, serverClose, err := newTestClaimExtractor(testClaimExtractorOpts{
+			idTokenPayload:        emptyJSON,
+			setProfileURL:         true,
+			profileRequestHeaders: newAuthorizedHeader(),
+			profileRequestHandler: jwtResponseHandler,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		if serverClose != nil {
+			defer serverClose()
+		}
+
+		value, exists, err := claimExtractor.GetClaim("user")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(exists).To(BeTrue())
+		Expect(value).To(Equal("jwtUser"))
+
+		value, exists, err = claimExtractor.GetClaim("email")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(exists).To(BeTrue())
+		Expect(value).To(Equal("jwtEmail"))
+
+		value, exists, err = claimExtractor.GetClaim("groups")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(exists).To(BeTrue())
+		Expect(value).To(Equal([]interface{}{"jwtGroup1", "jwtGroup2"}))
+	})
 })
 
 // ******************************************

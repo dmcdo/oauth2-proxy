@@ -7,13 +7,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options/util"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
-	"golang.org/x/sync/errgroup"
 )
 
 // Server represents an HTTP or HTTPS server.
@@ -35,6 +40,9 @@ type Opts struct {
 
 	// TLS is the TLS configuration for the server.
 	TLS *options.TLS
+
+	// Let testing infrastructure circumvent parsing file descriptors
+	fdFiles []*os.File
 }
 
 // NewServer creates a new Server from the options given.
@@ -42,6 +50,11 @@ func NewServer(opts Opts) (Server, error) {
 	s := &server{
 		handler: opts.Handler,
 	}
+
+	if len(opts.fdFiles) > 0 {
+		s.fdFiles = opts.fdFiles
+	}
+
 	if err := s.setupListener(opts); err != nil {
 		return nil, fmt.Errorf("error setting up listener: %v", err)
 	}
@@ -58,6 +71,9 @@ type server struct {
 
 	listener    net.Listener
 	tlsListener net.Listener
+
+	// ensure activation.Files are called once
+	fdFiles []*os.File
 }
 
 // setupListener sets the server listener if the HTTP server is enabled.
@@ -69,12 +85,22 @@ func (s *server) setupListener(opts Opts) error {
 		return nil
 	}
 
+	// Use fd: as a prefix for systemd socket activation, it's generic
+	// enough and short.
+	// The most common usage would be --http-address fd:3.
+	// This causes oauth2-proxy to just assume that the third fd passed
+	// to the program is indeed a net.Listener and starts using it
+	// without setting up a new listener.
+	if strings.HasPrefix(strings.ToLower(opts.BindAddress), "fd:") {
+		return s.checkSystemdSocketSupport(opts)
+	}
+
 	networkType := getNetworkScheme(opts.BindAddress)
 	listenAddr := getListenAddress(opts.BindAddress)
 
 	listener, err := net.Listen(networkType, listenAddr)
 	if err != nil {
-		return fmt.Errorf("listen (%s, %s) failed: %v", networkType, listenAddr, err)
+		return fmt.Errorf("listen (%s, %s) failed: %w", networkType, listenAddr, err)
 	}
 	s.listener = listener
 
@@ -119,11 +145,12 @@ func (s *server) setupTLSListener(opts Opts) error {
 	if opts.TLS == nil {
 		return errors.New("no TLS config provided")
 	}
-	cert, err := getCertificate(opts.TLS)
+
+	l, err := getCertificateLoader(opts.TLS)
 	if err != nil {
 		return fmt.Errorf("could not load certificate: %v", err)
 	}
-	config.Certificates = []tls.Certificate{cert}
+	config.GetCertificate = l.GetCertificate
 
 	if len(opts.TLS.CipherSuites) > 0 {
 		cipherSuites, err := parseCipherSuites(opts.TLS.CipherSuites)
@@ -151,7 +178,11 @@ func (s *server) setupTLSListener(opts Opts) error {
 		return fmt.Errorf("listen (%s) failed: %v", listenAddr, err)
 	}
 
-	s.tlsListener = tls.NewListener(tcpKeepAliveListener{listener.(*net.TCPListener)}, config)
+	ka := tcpKeepAliveListener{listener.(*net.TCPListener)}
+	s.tlsListener = reloadableTLSListener{
+		Listener: tls.NewListener(ka, config),
+		loader:   l,
+	}
 	return nil
 }
 
@@ -171,6 +202,23 @@ func (s *server) Start(ctx context.Context) error {
 	}
 
 	if s.tlsListener != nil {
+		rl := s.tlsListener.(reloadableTLSListener)
+		ch := make(chan os.Signal, 1)
+
+		g.Go(func() error {
+			for {
+				select {
+				case <-ch:
+					if err := rl.Reload(); err != nil {
+						logger.Errorf("Error reloading TLS certificate: %v", err)
+					}
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})
+		signal.Notify(ch, syscall.SIGHUP)
+
 		g.Go(func() error {
 			if err := s.startServer(groupCtx, s.tlsListener); err != nil {
 				return fmt.Errorf("error starting secure server: %v", err)
@@ -230,24 +278,63 @@ func getListenAddress(addr string) string {
 	return slice[len(slice)-1]
 }
 
-// getCertificate loads the certificate data from the TLS config.
-func getCertificate(opts *options.TLS) (tls.Certificate, error) {
-	keyData, err := getSecretValue(opts.Key)
+type tlsLoader struct {
+	*options.TLS
+
+	mu   sync.Mutex
+	cert *tls.Certificate
+}
+
+func (t *tlsLoader) LoadCert() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	keyData, err := getSecretValue(t.Key)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("could not load key data: %v", err)
+		return fmt.Errorf("could not load key data: %v", err)
 	}
 
-	certData, err := getSecretValue(opts.Cert)
+	certData, err := getSecretValue(t.Cert)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("could not load cert data: %v", err)
+		return fmt.Errorf("could not load cert data: %v", err)
 	}
 
 	cert, err := tls.X509KeyPair(certData, keyData)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("could not parse certificate data: %v", err)
+		return fmt.Errorf("could not parse certificate data: %v", err)
 	}
 
-	return cert, nil
+	t.cert = &cert
+	return nil
+}
+
+func (t *tlsLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if t.cert == nil {
+		return nil, fmt.Errorf("no certificate")
+	}
+
+	return t.cert, nil
+}
+
+func getCertificateLoader(opts *options.TLS) (*tlsLoader, error) {
+	l := &tlsLoader{
+		TLS: opts,
+	}
+
+	if err := l.LoadCert(); err != nil {
+		return nil, err
+	}
+
+	return l, nil
+}
+
+type reloadableTLSListener struct {
+	net.Listener
+	loader *tlsLoader
+}
+
+func (rl reloadableTLSListener) Reload() error {
+	return rl.loader.LoadCert()
 }
 
 // getSecretValue wraps util.GetSecretValue so that we can return an error if no
