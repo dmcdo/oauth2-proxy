@@ -45,11 +45,12 @@ type ProviderData struct {
 	SupportedCodeChallengeMethods []string `json:"code_challenge_methods_supported,omitempty"`
 
 	// Common OIDC options for any OIDC-based providers to consume
-	AllowUnverifiedEmail     bool
-	UserClaim                string
-	EmailClaim               string
-	GroupsClaim              string
-	Verifier                 internaloidc.IDTokenVerifier
+	AllowUnverifiedEmail bool
+	UserClaim            string
+	EmailClaim           string
+	GroupsClaim          string
+	Verifier             internaloidc.IDTokenVerifier
+	ExpirationCheck      internaloidc.IDTokenExpirationCheck
 	SkipClaimsFromProfileURL bool
 
 	// Universal Group authorization data structure
