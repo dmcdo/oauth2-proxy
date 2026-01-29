@@ -11,7 +11,6 @@ import (
 
 	middlewareapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
-	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/clock"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/providers"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -95,6 +94,7 @@ var _ = Describe("Stored Session Suite", func() {
 		now := time.Now()
 		createdPast := now.Add(-5 * time.Minute)
 		createdFuture := now.Add(5 * time.Minute)
+		clock := func() time.Time { return now }
 
 		var defaultRefreshFunc = func(_ context.Context, ss *sessionsapi.SessionState) (bool, error) {
 			switch ss.RefreshToken {
@@ -124,6 +124,7 @@ var _ = Describe("Stored Session Suite", func() {
 						RefreshToken: noRefresh,
 						CreatedAt:    &createdPast,
 						ExpiresOn:    &createdFuture,
+						Clock:        clock,
 					}, nil
 				case "_oauth2_proxy=InvalidNoRefreshSession":
 					return &sessionsapi.SessionState{
@@ -131,24 +132,28 @@ var _ = Describe("Stored Session Suite", func() {
 						RefreshToken: noRefresh,
 						CreatedAt:    &createdPast,
 						ExpiresOn:    &createdFuture,
+						Clock:        clock,
 					}, nil
 				case "_oauth2_proxy=ExpiredNoRefreshSession":
 					return &sessionsapi.SessionState{
 						RefreshToken: noRefresh,
 						CreatedAt:    &createdPast,
 						ExpiresOn:    &createdPast,
+						Clock:        clock,
 					}, nil
 				case "_oauth2_proxy=RefreshSession":
 					return &sessionsapi.SessionState{
 						RefreshToken: refresh,
 						CreatedAt:    &createdPast,
 						ExpiresOn:    &createdFuture,
+						Clock:        clock,
 					}, nil
 				case "_oauth2_proxy=RefreshError":
 					return &sessionsapi.SessionState{
 						RefreshToken: "RefreshError",
 						CreatedAt:    &createdPast,
 						ExpiresOn:    &createdFuture,
+						Clock:        clock,
 					}, nil
 				case "_oauth2_proxy=IDTokenExpired":
 					return &sessionsapi.SessionState{
@@ -164,14 +169,6 @@ var _ = Describe("Stored Session Suite", func() {
 				}
 			},
 		}
-
-		BeforeEach(func() {
-			clock.Set(now)
-		})
-
-		AfterEach(func() {
-			clock.Reset()
-		})
 
 		type storedSessionLoaderTableInput struct {
 			requestHeaders   http.Header
@@ -213,7 +210,15 @@ var _ = Describe("Stored Session Suite", func() {
 				}))
 				handler.ServeHTTP(rw, req)
 
-				Expect(gotSession).To(Equal(in.expectedSession))
+				// Compare, ignoring testing Clock.
+				if in.expectedSession == nil {
+					Expect(gotSession).To(BeNil())
+					return
+				}
+				Expect(gotSession).ToNot(BeNil())
+				got := *gotSession
+				got.Clock = nil
+				Expect(&got).To(Equal(in.expectedSession))
 			},
 			Entry("with no cookie", storedSessionLoaderTableInput{
 				requestHeaders:   http.Header{},
