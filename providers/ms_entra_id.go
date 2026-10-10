@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -195,6 +196,7 @@ func (p *MicrosoftEntraIDProvider) redeemRefreshTokenWithFederatedToken(ctx cont
 		s.User = newSession.User
 		s.Groups = newSession.Groups
 		s.PreferredUsername = newSession.PreferredUsername
+		s.AdditionalClaims = newSession.AdditionalClaims
 	}
 
 	s.AccessToken = newSession.AccessToken
@@ -246,8 +248,7 @@ func (p *MicrosoftEntraIDProvider) addGraphGroupsToSession(ctx context.Context, 
 			UnmarshalSimpleJSON()
 
 		if err != nil {
-			logger.Errorf("invalid response from microsoft graph, no groups added to session: %v", err)
-			return nil
+			return fmt.Errorf("invalid response from microsoft graph: %w", err)
 		}
 		reqGroups := response.Get("value").MustArray()
 
@@ -304,7 +305,7 @@ func (p *MicrosoftEntraIDProvider) checkTenantMatchesTenantList(tenant string, a
 func (p *MicrosoftEntraIDProvider) fetchToken(ctx context.Context, params url.Values) (*oauth2.Token, error) {
 	resp := requests.New(p.RedeemURL.String()).
 		WithContext(ctx).
-		WithMethod("POST").
+		WithMethod(http.MethodPost).
 		WithBody(bytes.NewBufferString(params.Encode())).
 		SetHeader("Content-Type", "application/x-www-form-urlencoded").
 		Do()
